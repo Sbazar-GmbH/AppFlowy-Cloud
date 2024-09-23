@@ -1,12 +1,13 @@
-use std::ops::Deref;
-use std::sync::atomic::AtomicU32;
-use std::sync::{Arc, Weak};
-
+use arc_swap::ArcSwap;
 use collab::lock::{Mutex, RwLock};
 use collab::preclude::updates::encoder::Encode;
 use collab::preclude::{Collab, ReadTxn, Snapshot, StateVector};
 use collab_entity::CollabType;
-use tracing::{trace, warn};
+
+use std::ops::Deref;
+
+use std::sync::{Arc, Weak};
+use tracing::warn;
 
 use tonic_proto::history::SnapshotMetaPb;
 
@@ -15,56 +16,108 @@ pub struct SnapshotGenerator {
   object_id: String,
   mutex_collab: Weak<RwLock<Collab>>,
   collab_type: CollabType,
-  apply_update_count: Arc<AtomicU32>,
+  current_update_count: Arc<ArcSwap<u32>>,
+  prev_edit_count: Arc<ArcSwap<u32>>,
   pending_snapshots: Arc<Mutex<Vec<CollabSnapshot>>>,
 }
 
 impl SnapshotGenerator {
-  pub fn new(object_id: &str, mutex_collab: Weak<RwLock<Collab>>, collab_type: CollabType) -> Self {
+  pub fn new(
+    object_id: &str,
+    mutex_collab: Weak<RwLock<Collab>>,
+    collab_type: CollabType,
+    edit_count: u32,
+  ) -> Self {
     Self {
       object_id: object_id.to_string(),
       mutex_collab,
       collab_type,
-      apply_update_count: Default::default(),
+      current_update_count: Arc::new(ArcSwap::new(Arc::new(edit_count))),
+      prev_edit_count: Arc::new(ArcSwap::new(Arc::new(edit_count))),
       pending_snapshots: Default::default(),
     }
   }
 
-  pub async fn take_pending_snapshots(&self) -> Vec<CollabSnapshot> {
+  pub async fn consume_pending_snapshots(&self) -> Vec<CollabSnapshot> {
     //FIXME: this should be either a channel or lockless immutable queue
     let mut lock = self.pending_snapshots.lock().await;
     std::mem::take(&mut *lock)
   }
 
-  pub fn did_apply_update(&self, _update: &[u8]) {
-    let prev_apply_update_count = self
-      .apply_update_count
-      .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+  pub async fn has_snapshot(&self) -> bool {
+    !self.pending_snapshots.lock().await.is_empty()
+  }
 
-    // keep it simple for now. we just compare the update count to determine if we need to generate a snapshot.
-    // in the future, we can use a more sophisticated algorithm to determine when to generate a snapshot.
-    let threshold = gen_snapshot_threshold(&self.collab_type);
-    // trace!(
-    //   "[History] did_apply_update: object_id={}, current={}, threshold={}",
-    //   self.object_id,
-    //   prev_apply_update_count,
-    //   threshold,
-    // );
-    if prev_apply_update_count + 1 >= threshold {
-      self
-        .apply_update_count
-        .store(0, std::sync::atomic::Ordering::SeqCst);
+  pub async fn num_pending_snapshots(&self) -> usize {
+    self.pending_snapshots.lock().await.len()
+  }
 
+  /// Generate a snapshot if the current edit count is not zero.
+  pub async fn generate(&self) {
+    if let Some(collab) = self.mutex_collab.upgrade() {
+      let current = self.current_update_count.load_full();
+      let prev = self.prev_edit_count.load_full();
+      if current < prev {
+        return;
+      }
+      let threshold_count = *current - *prev;
+      if threshold_count > snapshot_min_edit_threshold(&self.collab_type) {
+        self
+          .prev_edit_count
+          .store(self.current_update_count.load_full());
+
+        #[cfg(feature = "verbose_log")]
+        tracing::trace!("[History]: object:{} generating snapshot", self.object_id);
+        let snapshot = gen_snapshot(
+          &*collab.read().await,
+          &self.object_id,
+          "generate snapshot by periodic tick",
+        );
+        self.pending_snapshots.lock().await.push(snapshot);
+      }
+    } else {
+      warn!("collab is dropped. cannot generate snapshot")
+    }
+  }
+
+  pub fn did_apply_update<T: ReadTxn>(&self, txn: &T) {
+    let txn_edit_count = calculate_edit_count(txn);
+    self
+      .current_update_count
+      .store(Arc::new(txn_edit_count as u32));
+
+    let current = self.current_update_count.load_full();
+    let prev = self.prev_edit_count.load_full();
+    if current < prev {
+      warn!(
+        "object:{} current edit count:{} is less than prev edit count:{}",
+        self.object_id, current, prev
+      );
+      return;
+    }
+    let threshold_count = *current - *prev;
+    let threshold = snapshot_max_edit_threshold(&self.collab_type);
+    #[cfg(feature = "verbose_log")]
+    tracing::trace!(
+      "[History] object_id:{}, update count:{}, threshold={}",
+      self.object_id,
+      threshold_count,
+      threshold,
+    );
+
+    if threshold_count + 1 >= threshold {
+      self.prev_edit_count.store(Arc::new(txn_edit_count as u32));
       let pending_snapshots = self.pending_snapshots.clone();
       let mutex_collab = self.mutex_collab.clone();
       let object_id = self.object_id.clone();
       tokio::spawn(async move {
         if let Some(collab) = mutex_collab.upgrade() {
-          trace!("[History] attempting to generate snapshot");
-          let snapshot = gen_snapshot(&*collab.read().await, &object_id);
-          trace!("[History] did generate snapshot for {}", snapshot.object_id);
+          let snapshot = gen_snapshot(
+            &*collab.read().await,
+            &object_id,
+            &format!("Current edit:{}, threshold:{}", threshold_count, threshold),
+          );
           pending_snapshots.lock().await.push(snapshot);
-          warn!("Exceeded maximum retry attempts for snapshot generation");
         } else {
           warn!("collab is dropped. cannot generate snapshot")
         }
@@ -74,14 +127,14 @@ impl SnapshotGenerator {
 }
 
 #[inline]
-fn gen_snapshot_threshold(collab_type: &CollabType) -> u32 {
+fn snapshot_max_edit_threshold(collab_type: &CollabType) -> u32 {
   match collab_type {
-    CollabType::Document => 100,
-    CollabType::Database => 20,
-    CollabType::WorkspaceDatabase => 20,
-    CollabType::Folder => 20,
+    CollabType::Document => 500,
+    CollabType::Database => 30,
+    CollabType::WorkspaceDatabase => 10,
+    CollabType::Folder => 10,
     CollabType::DatabaseRow => 10,
-    CollabType::UserAwareness => 50,
+    CollabType::UserAwareness => 20,
     CollabType::Unknown => {
       if cfg!(debug_assertions) {
         5
@@ -93,7 +146,25 @@ fn gen_snapshot_threshold(collab_type: &CollabType) -> u32 {
 }
 
 #[inline]
-pub fn gen_snapshot(collab: &Collab, object_id: &str) -> CollabSnapshot {
+fn snapshot_min_edit_threshold(collab_type: &CollabType) -> u32 {
+  match collab_type {
+    CollabType::Document => 50,
+    CollabType::Database => 10,
+    CollabType::WorkspaceDatabase => 10,
+    CollabType::Folder => 10,
+    CollabType::DatabaseRow => 10,
+    CollabType::UserAwareness => 10,
+    CollabType::Unknown => 5,
+  }
+}
+#[inline]
+pub fn gen_snapshot(collab: &Collab, object_id: &str, reason: &str) -> CollabSnapshot {
+  tracing::trace!(
+    "[History]: generate {} snapshot, reason: {}",
+    object_id,
+    reason
+  );
+
   let snapshot = collab.transact().snapshot();
   let timestamp = chrono::Utc::now().timestamp();
   CollabSnapshot::new(object_id, snapshot, timestamp)
@@ -181,4 +252,23 @@ impl From<CollabSnapshot> for SnapshotMetaPb {
       created_at: snapshot.created_at,
     }
   }
+}
+
+#[inline]
+pub(crate) fn calculate_edit_count<T: ReadTxn>(txn: &T) -> u64 {
+  let snapshot = txn.snapshot();
+  let mut insert_count = 0;
+  for (_, &clock) in snapshot.state_map.iter() {
+    insert_count += clock as u64;
+  }
+
+  let mut delete_count = 0;
+  for (_, range) in snapshot.delete_set.iter() {
+    for f in range.iter() {
+      let deleted_segments = f.len() as u64;
+      delete_count += deleted_segments;
+    }
+  }
+
+  insert_count + delete_count
 }

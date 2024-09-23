@@ -13,12 +13,14 @@ use collab::core::origin::{CollabClient, CollabOrigin};
 use collab::entity::EncodedCollab;
 use collab::lock::{Mutex, RwLock};
 use collab::preclude::{Collab, Prelim};
+use collab_database::workspace_database::WorkspaceDatabaseBody;
 use collab_entity::CollabType;
 use collab_folder::Folder;
 use collab_user::core::UserAwareness;
 use mime::Mime;
 use serde::Deserialize;
 use serde_json::{json, Value};
+use shared_entity::dto::publish_dto::PublishViewMetaData;
 use tokio::time::{sleep, timeout, Duration};
 use tokio_stream::StreamExt;
 use tracing::trace;
@@ -27,7 +29,7 @@ use uuid::Uuid;
 #[cfg(feature = "collab-sync")]
 use client_api::collab_sync::{SinkConfig, SyncObject, SyncPlugin};
 use client_api::entity::id::user_awareness_object_id;
-use client_api::entity::QueryWorkspaceMember;
+use client_api::entity::{PublishCollabItem, PublishCollabMetadata, QueryWorkspaceMember};
 use client_api::ws::{WSClient, WSClientConfig};
 use database_entity::dto::{
   AFAccessLevel, AFRole, AFSnapshotMeta, AFSnapshotMetas, AFUserProfile, AFUserWorkspaceInfo,
@@ -190,25 +192,48 @@ impl TestClient {
     .unwrap()
   }
 
-  pub async fn get_workspace_database_collab(&mut self, workspace_id: &str) -> Collab {
+  pub async fn get_workspace_database_collab(&self, workspace_id: &str) -> Collab {
     let db_storage_id = self.open_workspace(workspace_id).await.database_storage_id;
-    let ws_db_doc_state = self
-      .get_collab(QueryCollabParams {
-        workspace_id: workspace_id.to_string(),
-        inner: QueryCollab {
-          object_id: db_storage_id.to_string(),
-          collab_type: CollabType::WorkspaceDatabase,
-        },
-      })
+    let collab_resp = self
+      .get_collab(
+        workspace_id.to_string(),
+        db_storage_id.to_string(),
+        CollabType::WorkspaceDatabase,
+      )
       .await
-      .unwrap()
-      .encode_collab
-      .doc_state
-      .to_vec();
+      .unwrap();
     Collab::new_with_source(
       CollabOrigin::Server,
       &db_storage_id.to_string(),
-      DataSource::DocStateV1(ws_db_doc_state),
+      collab_resp.encode_collab.into(),
+      vec![],
+      false,
+    )
+    .unwrap()
+  }
+
+  pub async fn get_db_collab_from_view(&mut self, workspace_id: &str, view_id: &str) -> Collab {
+    let mut ws_db_collab = self.get_workspace_database_collab(workspace_id).await;
+    let ws_db_body = WorkspaceDatabaseBody::open(&mut ws_db_collab);
+    let txn = ws_db_collab.transact();
+    let db_id = ws_db_body
+      .get_all_database_meta(&txn)
+      .into_iter()
+      .find(|db_meta| db_meta.linked_views.contains(&view_id.to_string()))
+      .unwrap()
+      .database_id;
+    let db_collab_collab_resp = self
+      .get_collab(
+        workspace_id.to_string(),
+        db_id.clone(),
+        CollabType::Database,
+      )
+      .await
+      .unwrap();
+    Collab::new_with_source(
+      CollabOrigin::Server,
+      &db_id,
+      db_collab_collab_resp.encode_collab.into(),
       vec![],
       false,
     )
@@ -539,10 +564,41 @@ impl TestClient {
   }
 
   pub async fn get_collab(
-    &mut self,
-    query: QueryCollabParams,
+    &self,
+    workspace_id: String,
+    object_id: String,
+    collab_type: CollabType,
   ) -> Result<CollabResponse, AppResponseError> {
-    self.api_client.get_collab(query).await
+    self
+      .api_client
+      .get_collab(QueryCollabParams {
+        workspace_id,
+        inner: QueryCollab {
+          object_id,
+          collab_type,
+        },
+      })
+      .await
+  }
+
+  pub async fn get_collab_to_collab(
+    &self,
+    workspace_id: String,
+    object_id: String,
+    collab_type: CollabType,
+  ) -> Result<Collab, AppResponseError> {
+    let resp = self
+      .get_collab(workspace_id, object_id.clone(), collab_type)
+      .await?;
+    let collab = Collab::new_with_source(
+      CollabOrigin::Server,
+      &object_id,
+      resp.encode_collab.into(),
+      vec![],
+      false,
+    )
+    .unwrap();
+    Ok(collab)
   }
 
   pub async fn batch_get_collab(
@@ -774,6 +830,31 @@ impl TestClient {
     let lock = self.collabs.get(object_id).unwrap().collab.read().await;
     let collab = (*lock).borrow();
     collab.to_json_value()
+  }
+
+  /// data: [(view_id, meta_json, blob_hex)]
+  pub async fn publish_collabs(&self, workspace_id: &str, data: Vec<(Uuid, &str, &str)>) {
+    let pub_items = data
+      .into_iter()
+      .map(|(view_id, meta_json, blob_hex)| {
+        let meta: PublishViewMetaData = serde_json::from_str(meta_json).unwrap();
+        let blob = hex::decode(blob_hex).unwrap();
+        PublishCollabItem {
+          meta: PublishCollabMetadata {
+            view_id,
+            publish_name: uuid::Uuid::new_v4().to_string(),
+            metadata: meta,
+          },
+          data: blob,
+        }
+      })
+      .collect();
+
+    self
+      .api_client
+      .publish_collabs(workspace_id, pub_items)
+      .await
+      .unwrap();
   }
 }
 

@@ -139,6 +139,12 @@ pub enum AppError {
 
   #[error("{0}")]
   InvalidPublishedOutline(String),
+
+  #[error("{0}")]
+  InvalidFolderView(String),
+
+  #[error("{0}")]
+  NotInviteeOfWorkspaceInvitation(String),
 }
 
 impl AppError {
@@ -204,6 +210,8 @@ impl AppError {
       AppError::StringLengthLimitReached(_) => ErrorCode::StringLengthLimitReached,
       AppError::InvalidContentType(_) => ErrorCode::InvalidContentType,
       AppError::InvalidPublishedOutline(_) => ErrorCode::InvalidPublishedOutline,
+      AppError::InvalidFolderView(_) => ErrorCode::InvalidFolderView,
+      AppError::NotInviteeOfWorkspaceInvitation(_) => ErrorCode::NotInviteeOfWorkspaceInvitation,
     }
   }
 }
@@ -267,6 +275,12 @@ impl From<crate::gotrue::GoTrueError> for AppError {
   }
 }
 
+impl From<String> for AppError {
+  fn from(err: String) -> Self {
+    AppError::Unhandled(err)
+  }
+}
+
 #[cfg_attr(target_arch = "wasm32", derive(tsify::Tsify))]
 #[derive(
   Eq,
@@ -323,6 +337,8 @@ pub enum ErrorCode {
   SingleUploadLimitExceeded = 1037,
   AppleRevokeTokenError = 1038,
   InvalidPublishedOutline = 1039,
+  InvalidFolderView = 1040,
+  NotInviteeOfWorkspaceInvitation = 1041,
 }
 
 impl ErrorCode {

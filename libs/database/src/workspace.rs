@@ -1,6 +1,6 @@
 use database_entity::dto::{
   AFRole, AFWorkspaceInvitation, AFWorkspaceInvitationStatus, AFWorkspaceSettings, GlobalComment,
-  PublishCollabItem, PublishInfo, Reaction,
+  PublishInfo, Reaction,
 };
 use futures_util::stream::BoxStream;
 use sqlx::{types::uuid, Executor, PgPool, Postgres, Transaction};
@@ -409,22 +409,68 @@ pub async fn select_workspace_invitations_for_user(
   let res = sqlx::query_as!(
     AFWorkspaceInvitation,
     r#"
-    SELECT
-      id AS invite_id,
-      workspace_id,
-      (SELECT workspace_name FROM public.af_workspace WHERE workspace_id = af_workspace_invitation.workspace_id),
-      (SELECT email FROM public.af_user WHERE uid = af_workspace_invitation.inviter) AS inviter_email,
-      (SELECT name FROM public.af_user WHERE uid = af_workspace_invitation.inviter) AS inviter_name,
-      status,
-      updated_at
-    FROM
-      public.af_workspace_invitation
-    WHERE af_workspace_invitation.invitee_email = (SELECT email FROM public.af_user WHERE uuid = $1)
-    AND ($2::SMALLINT IS NULL OR status = $2)
+      SELECT
+        i.id AS invite_id,
+        i.workspace_id,
+        w.workspace_name,
+        u_inviter.email AS inviter_email,
+        u_inviter.name AS inviter_name,
+        i.status,
+        i.updated_at,
+        u_inviter.metadata->>'icon_url' AS inviter_icon,
+        w.icon AS workspace_icon,
+        (SELECT COUNT(*) FROM public.af_workspace_member m WHERE m.workspace_id = i.workspace_id) AS member_count
+      FROM
+        public.af_workspace_invitation i
+        JOIN public.af_workspace w ON i.workspace_id = w.workspace_id
+        JOIN public.af_user u_inviter ON i.inviter = u_inviter.uid
+        JOIN public.af_user u_invitee ON u_invitee.uuid = $1
+      WHERE
+        i.invitee_email = u_invitee.email
+        AND ($2::SMALLINT IS NULL OR i.status = $2);
     "#,
     invitee_uuid,
     status_filter.map(|s| s as i16)
-  ).fetch_all(pg_pool).await?;
+  )
+  .fetch_all(pg_pool)
+  .await?;
+  Ok(res)
+}
+
+#[inline]
+pub async fn select_workspace_invitation_for_user(
+  pg_pool: &PgPool,
+  invitee_uuid: &Uuid,
+  invite_id: &Uuid,
+) -> Result<AFWorkspaceInvitation, AppError> {
+  let res = sqlx::query_as!(
+    AFWorkspaceInvitation,
+    r#"
+      SELECT
+        i.id AS invite_id,
+        i.workspace_id,
+        w.workspace_name,
+        u_inviter.email AS inviter_email,
+        u_inviter.name AS inviter_name,
+        i.status,
+        i.updated_at,
+        u_inviter.metadata->>'icon_url' AS inviter_icon,
+        w.icon AS workspace_icon,
+        (SELECT COUNT(*) FROM public.af_workspace_member m WHERE m.workspace_id = i.workspace_id) AS member_count
+      FROM
+        public.af_workspace_invitation i
+        JOIN public.af_workspace w ON i.workspace_id = w.workspace_id
+        JOIN public.af_user u_inviter ON i.inviter = u_inviter.uid
+        JOIN public.af_user u_invitee ON u_invitee.uuid = $1
+      WHERE
+        i.invitee_email = u_invitee.email
+        AND i.id = $2;
+    "#,
+    invitee_uuid,
+    invite_id,
+  )
+  .fetch_one(pg_pool)
+  .await?;
   Ok(res)
 }
 
@@ -1008,62 +1054,6 @@ pub async fn select_workspace_publish_namespace<'a, E: Executor<'a, Database = P
 }
 
 #[inline]
-pub async fn insert_or_replace_publish_collab_metas<'a, E: Executor<'a, Database = Postgres>>(
-  executor: E,
-  workspace_id: &Uuid,
-  publisher_uuid: &Uuid,
-  publish_item: &[PublishCollabItem<serde_json::Value, Vec<u8>>],
-) -> Result<(), AppError> {
-  let view_ids: Vec<Uuid> = publish_item.iter().map(|item| item.meta.view_id).collect();
-  let publish_names: Vec<String> = publish_item
-    .iter()
-    .map(|item| item.meta.publish_name.clone())
-    .collect();
-  let metadatas: Vec<serde_json::Value> = publish_item
-    .iter()
-    .map(|item| item.meta.metadata.clone())
-    .collect();
-
-  let blobs: Vec<Vec<u8>> = publish_item.iter().map(|item| item.data.clone()).collect();
-  let res = sqlx::query!(
-    r#"
-      INSERT INTO af_published_collab (workspace_id, view_id, publish_name, published_by, metadata, blob)
-      SELECT * FROM UNNEST(
-        (SELECT array_agg((SELECT $1::uuid)) FROM generate_series(1, $7))::uuid[],
-        $2::uuid[],
-        $3::text[],
-        (SELECT array_agg((SELECT uid FROM af_user WHERE uuid = $4)) FROM generate_series(1, $7))::bigint[],
-        $5::jsonb[],
-        $6::bytea[]
-      )
-      ON CONFLICT (workspace_id, view_id) DO UPDATE
-      SET metadata = EXCLUDED.metadata,
-          blob = EXCLUDED.blob,
-          published_by = EXCLUDED.published_by,
-          publish_name = EXCLUDED.publish_name
-    "#,
-    workspace_id,
-    &view_ids,
-    &publish_names,
-    publisher_uuid,
-    &metadatas,
-    &blobs,
-    publish_item.len() as i32,
-  )
-  .execute(executor)
-  .await?;
-
-  if res.rows_affected() != publish_item.len() as u64 {
-    tracing::warn!(
-      "Failed to insert or replace publish collab meta batch, workspace_id: {}, publisher_uuid: {}, rows_affected: {}",
-      workspace_id, publisher_uuid, res.rows_affected()
-    );
-  }
-
-  Ok(())
-}
-
-#[inline]
 pub async fn select_publish_collab_meta<'a, E: Executor<'a, Database = Postgres>>(
   executor: E,
   publish_namespace: &str,
@@ -1385,4 +1375,25 @@ pub async fn delete_reaction_from_comment<'a, E: Executor<'a, Database = Postgre
   };
 
   Ok(())
+}
+
+pub async fn select_user_is_invitee_for_workspace_invitation(
+  pg_pool: &PgPool,
+  invitee_uuid: &Uuid,
+  invite_id: &Uuid,
+) -> Result<bool, AppError> {
+  let res = sqlx::query_scalar!(
+    r#"
+      SELECT EXISTS(
+        SELECT 1
+        FROM af_workspace_invitation
+        WHERE id = $1 AND invitee_email = (SELECT email FROM af_user WHERE uuid = $2)
+      )
+    "#,
+    invite_id,
+    invitee_uuid,
+  )
+  .fetch_one(pg_pool)
+  .await?;
+  res.map_or(Ok(false), Ok)
 }

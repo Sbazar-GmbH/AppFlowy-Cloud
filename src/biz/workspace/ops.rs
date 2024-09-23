@@ -1,6 +1,5 @@
 use authentication::jwt::OptionalUserUuid;
 use database_entity::dto::AFWorkspaceSettingsChange;
-use database_entity::dto::PublishCollabItem;
 use database_entity::dto::PublishInfo;
 use std::collections::HashMap;
 
@@ -127,20 +126,6 @@ pub async fn get_workspace_publish_namespace(
   workspace_id: &Uuid,
 ) -> Result<String, AppError> {
   select_workspace_publish_namespace(pg_pool, workspace_id).await
-}
-
-pub async fn publish_collabs(
-  pg_pool: &PgPool,
-  workspace_id: &Uuid,
-  publisher_uuid: &Uuid,
-  publish_items: &[PublishCollabItem<serde_json::Value, Vec<u8>>],
-) -> Result<(), AppError> {
-  for publish_item in publish_items {
-    check_collab_publish_name(publish_item.meta.publish_name.as_str())?;
-  }
-  insert_or_replace_publish_collab_metas(pg_pool, workspace_id, publisher_uuid, publish_items)
-    .await?;
-  Ok(())
 }
 
 pub async fn get_published_collab(
@@ -317,12 +302,21 @@ pub async fn open_workspace(
 pub async fn accept_workspace_invite(
   pg_pool: &PgPool,
   workspace_access_control: &impl WorkspaceAccessControl,
+  user_uid: i64,
   user_uuid: &Uuid,
   invite_id: &Uuid,
 ) -> Result<(), AppError> {
   let mut txn = pg_pool.begin().await?;
-  update_workspace_invitation_set_status_accepted(&mut txn, user_uuid, invite_id).await?;
   let inv = get_invitation_by_id(&mut txn, invite_id).await?;
+  if let Some(invitee_uid) = inv.invitee_uid {
+    if invitee_uid != user_uid {
+      return Err(AppError::NotInviteeOfWorkspaceInvitation(format!(
+        "User with uid {} is not the invitee for invite_id {}",
+        user_uid, invite_id
+      )));
+    }
+  }
+  update_workspace_invitation_set_status_accepted(&mut txn, user_uuid, invite_id).await?;
   let invited_uid = inv
     .invitee_uid
     .ok_or_else(|| AppError::Internal(anyhow::anyhow!("Invitee uid is missing for {:?}", inv)))?;
@@ -334,6 +328,7 @@ pub async fn accept_workspace_invite(
 }
 
 #[instrument(level = "debug", skip_all, err)]
+#[allow(clippy::too_many_arguments)]
 pub async fn invite_workspace_members(
   mailer: &Mailer,
   gotrue_admin: &GoTrueAdmin,
@@ -342,6 +337,7 @@ pub async fn invite_workspace_members(
   inviter: &Uuid,
   workspace_id: &Uuid,
   invitations: Vec<WorkspaceMemberInvitation>,
+  appflowy_web_url: Option<&str>,
 ) -> Result<(), AppError> {
   let mut txn = pg_pool
     .begin()
@@ -367,12 +363,17 @@ pub async fn invite_workspace_members(
   let pending_invitations =
     database::workspace::select_workspace_pending_invitations(pg_pool, workspace_id).await?;
 
-  for invitation in invitations {
+  // check if any of the invited users are already members of the workspace
+  for invitation in &invitations {
     if workspace_members_by_email.contains_key(&invitation.email) {
-      tracing::warn!("User already in workspace: {}", invitation.email);
-      continue;
+      return Err(AppError::InvalidRequest(format!(
+        "User with email {} is already a member of the workspace",
+        invitation.email
+      )));
     }
+  }
 
+  for invitation in invitations {
     let inviter_name = inviter_name.clone();
     let workspace_name = workspace_name.clone();
     let workspace_member_count = workspace_member_count.to_string();
@@ -399,32 +400,39 @@ pub async fn invite_workspace_members(
         .await?;
         invite_id
       },
-      Some(inv) => {
+      Some(invite_id) => {
         tracing::warn!("User already invited: {}", invitation.email);
-        *inv
+        *invite_id
       },
     };
 
     // Generate a link such that when clicked, the user is added to the workspace.
-    let accept_url = gotrue_client
-      .admin_generate_link(
-        &admin_token,
-        &GenerateLinkParams {
-          type_: GenerateLinkType::MagicLink,
-          email: invitation.email.clone(),
-          redirect_to: format!(
-            "/web/login-callback?action=accept_workspace_invite&workspace_invitation_id={}&workspace_name={}&workspace_icon={}&user_name={}&user_icon={}&workspace_member_count={}",
-            invite_id, workspace_name,
-            workspace_icon_url,
-            inviter_name,
-            user_icon_url,
-            workspace_member_count,
-          ),
-          ..Default::default()
+    let accept_url = {
+      match appflowy_web_url {
+        Some(appflowy_web_url) => format!("{}/accept-invitation?invited_id={}", appflowy_web_url, invite_id),
+        None => {
+          gotrue_client
+          .admin_generate_link(
+            &admin_token,
+            &GenerateLinkParams {
+              type_: GenerateLinkType::MagicLink,
+              email: invitation.email.clone(),
+              redirect_to: format!(
+                "/web/login-callback?action=accept_workspace_invite&workspace_invitation_id={}&workspace_name={}&workspace_icon={}&user_name={}&user_icon={}&workspace_member_count={}",
+                invite_id, workspace_name,
+                workspace_icon_url,
+                inviter_name,
+                user_icon_url,
+                workspace_member_count,
+              ),
+              ..Default::default()
+            },
+          )
+          .await?
+          .action_link
         },
-      )
-      .await?
-      .action_link;
+      }
+    };
 
     // send email can be slow, so send email in background
     let cloned_mailer = mailer.clone();
@@ -463,6 +471,23 @@ pub async fn list_workspace_invitations_for_user(
 ) -> Result<Vec<AFWorkspaceInvitation>, AppError> {
   let invis = select_workspace_invitations_for_user(pg_pool, user_uuid, status).await?;
   Ok(invis)
+}
+
+pub async fn get_workspace_invitations_for_user(
+  pg_pool: &PgPool,
+  user_uuid: &Uuid,
+  invite_id: &Uuid,
+) -> Result<AFWorkspaceInvitation, AppError> {
+  let user_is_invitee =
+    select_user_is_invitee_for_workspace_invitation(pg_pool, user_uuid, invite_id).await?;
+  if !user_is_invitee {
+    return Err(AppError::NotInviteeOfWorkspaceInvitation(format!(
+      "User with uuid {} is not the invitee for invite_id {}",
+      user_uuid, invite_id
+    )));
+  }
+  let invitation = select_workspace_invitation_for_user(pg_pool, user_uuid, invite_id).await?;
+  Ok(invitation)
 }
 
 // use in tests only
@@ -714,25 +739,5 @@ async fn check_if_user_is_allowed_to_delete_comment(
       "User is not allowed to delete this comment".to_string(),
     ));
   }
-  Ok(())
-}
-
-fn check_collab_publish_name(publish_name: &str) -> Result<(), AppError> {
-  // Check len
-  if publish_name.len() > 128 {
-    return Err(AppError::InvalidRequest(
-      "Publish name must be at most 128 characters long".to_string(),
-    ));
-  }
-
-  // Only contain alphanumeric characters and hyphens
-  for c in publish_name.chars() {
-    if !c.is_alphanumeric() && c != '-' {
-      return Err(AppError::InvalidRequest(
-        "Publish name must only contain alphanumeric characters and hyphens".to_string(),
-      ));
-    }
-  }
-
   Ok(())
 }

@@ -1,9 +1,9 @@
 use chrono::{DateTime, Utc};
 use collab_entity::{CollabType, EncodedCollab};
-use database_entity::dto::{AFRole, AFWorkspaceInvitationStatus};
+use database_entity::dto::{AFRole, AFWebUser, AFWorkspaceInvitationStatus};
 use serde::{Deserialize, Serialize};
 use serde_repr::{Deserialize_repr, Serialize_repr};
-use std::ops::Deref;
+use std::{collections::HashMap, ops::Deref};
 use uuid::Uuid;
 
 #[derive(Deserialize, Serialize)]
@@ -123,6 +123,20 @@ pub struct CollabResponse {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PageCollabData {
+  pub encoded_collab: Vec<u8>,
+  pub row_data: HashMap<String, Vec<u8>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PageCollab {
+  pub view: FolderView,
+  pub data: PageCollabData,
+  pub owner: Option<AFWebUser>,
+  pub last_editor: Option<AFWebUser>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PublishedDuplicate {
   pub published_view_id: String,
   pub dest_view_id: String,
@@ -135,9 +149,18 @@ pub struct FolderView {
   pub icon: Option<ViewIcon>,
   pub is_space: bool,
   pub is_private: bool,
+  pub is_published: bool,
+  pub layout: ViewLayout,
+  pub created_at: DateTime<Utc>,
+  pub last_edited_time: DateTime<Utc>,
   /// contains fields like `is_space`, and font information
   pub extra: Option<serde_json::Value>,
   pub children: Vec<FolderView>,
+}
+
+#[derive(Default, Debug, Clone, Serialize, Deserialize)]
+pub struct SectionItems {
+  pub views: Vec<FolderView>,
 }
 
 #[derive(Eq, PartialEq, Debug, Hash, Clone, Serialize_repr, Deserialize_repr)]
@@ -178,6 +201,7 @@ pub struct QueryWorkspaceParam {
 #[derive(Default, Debug, Deserialize, Serialize)]
 pub struct QueryWorkspaceFolder {
   pub depth: Option<u32>,
+  pub root_view_id: Option<String>,
 }
 
 #[derive(Default, Debug, Clone, Serialize, Deserialize)]

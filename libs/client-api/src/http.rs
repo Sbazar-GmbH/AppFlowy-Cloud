@@ -4,6 +4,7 @@ use client_api_entity::auth_dto::DeleteUserQuery;
 use client_api_entity::workspace_dto::FolderView;
 use client_api_entity::workspace_dto::QueryWorkspaceFolder;
 use client_api_entity::workspace_dto::QueryWorkspaceParam;
+use client_api_entity::workspace_dto::SectionItems;
 use client_api_entity::AuthProvider;
 use client_api_entity::CollabType;
 use gotrue::grant::PasswordGrant;
@@ -687,12 +688,16 @@ impl Client {
     &self,
     workspace_id: &str,
     depth: Option<u32>,
+    root_view_id: Option<String>,
   ) -> Result<FolderView, AppResponseError> {
     let url = format!("{}/api/workspace/{}/folder", self.base_url, workspace_id);
     let resp = self
       .http_client_with_auth(Method::GET, &url)
       .await?
-      .query(&QueryWorkspaceFolder { depth })
+      .query(&QueryWorkspaceFolder {
+        depth,
+        root_view_id,
+      })
       .send()
       .await?;
     log_request_id(&resp);
@@ -711,6 +716,57 @@ impl Client {
       .await?;
     log_request_id(&resp);
     AppResponse::<AFWorkspace>::from_response(resp)
+      .await?
+      .into_data()
+  }
+
+  #[instrument(level = "info", skip_all, err)]
+  pub async fn get_workspace_favorite(
+    &self,
+    workspace_id: &str,
+  ) -> Result<SectionItems, AppResponseError> {
+    let url = format!("{}/api/workspace/{}/favorite", self.base_url, workspace_id);
+    let resp = self
+      .http_client_with_auth(Method::GET, &url)
+      .await?
+      .send()
+      .await?;
+    log_request_id(&resp);
+    AppResponse::<SectionItems>::from_response(resp)
+      .await?
+      .into_data()
+  }
+
+  #[instrument(level = "info", skip_all, err)]
+  pub async fn get_workspace_recent(
+    &self,
+    workspace_id: &str,
+  ) -> Result<SectionItems, AppResponseError> {
+    let url = format!("{}/api/workspace/{}/recent", self.base_url, workspace_id);
+    let resp = self
+      .http_client_with_auth(Method::GET, &url)
+      .await?
+      .send()
+      .await?;
+    log_request_id(&resp);
+    AppResponse::<SectionItems>::from_response(resp)
+      .await?
+      .into_data()
+  }
+
+  #[instrument(level = "info", skip_all, err)]
+  pub async fn get_workspace_trash(
+    &self,
+    workspace_id: &str,
+  ) -> Result<SectionItems, AppResponseError> {
+    let url = format!("{}/api/workspace/{}/trash", self.base_url, workspace_id);
+    let resp = self
+      .http_client_with_auth(Method::GET, &url)
+      .await?
+      .send()
+      .await?;
+    log_request_id(&resp);
+    AppResponse::<SectionItems>::from_response(resp)
       .await?
       .into_data()
   }
@@ -1028,25 +1084,41 @@ pub(crate) fn log_request_id(resp: &reqwest::Response) {
 }
 
 #[cfg(feature = "enable_brotli")]
-pub async fn spawn_blocking_brotli_compress(
+pub fn brotli_compress(
   data: Vec<u8>,
   quality: u32,
   buffer_size: usize,
 ) -> Result<Vec<u8>, AppError> {
-  tokio::task::spawn_blocking(move || {
-    let mut compressor = brotli::CompressorReader::new(&*data, buffer_size, quality, 22);
-    let mut compressed_data = Vec::new();
-    compressor
-      .read_to_end(&mut compressed_data)
-      .map_err(|err| AppError::InvalidRequest(format!("Failed to compress data: {}", err)))?;
-    Ok(compressed_data)
-  })
-  .await
-  .map_err(AppError::from)?
+  let mut compressor = brotli::CompressorReader::new(&*data, buffer_size, quality, 22);
+  let mut compressed_data = Vec::new();
+  compressor
+    .read_to_end(&mut compressed_data)
+    .map_err(|err| AppError::InvalidRequest(format!("Failed to compress data: {}", err)))?;
+  Ok(compressed_data)
+}
+
+#[cfg(feature = "enable_brotli")]
+pub async fn blocking_brotli_compress(
+  data: Vec<u8>,
+  quality: u32,
+  buffer_size: usize,
+) -> Result<Vec<u8>, AppError> {
+  tokio::task::spawn_blocking(move || brotli_compress(data, quality, buffer_size))
+    .await
+    .map_err(AppError::from)?
 }
 
 #[cfg(not(feature = "enable_brotli"))]
-pub async fn spawn_blocking_brotli_compress(
+pub async fn blocking_brotli_compress(
+  data: Vec<u8>,
+  _quality: u32,
+  _buffer_size: usize,
+) -> Result<Vec<u8>, AppError> {
+  Ok(data)
+}
+
+#[cfg(not(feature = "enable_brotli"))]
+pub fn brotli_compress(
   data: Vec<u8>,
   _quality: u32,
   _buffer_size: usize,
